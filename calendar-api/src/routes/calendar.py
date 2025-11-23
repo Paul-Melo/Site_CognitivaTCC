@@ -1,0 +1,515 @@
+from flask import Blueprint, request, redirect, url_for, session, jsonify, current_app
+from src.models.user import db, User, Appointment
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import os
+
+calendar_bp = Blueprint("calendar_bp", __name__)
+
+# Configurações do OAuth 2.0
+CLIENT_SECRETS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "client_secret.json")
+SCOPES = ["https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar.readonly"]
+
+# Timezone do Brasil
+BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
+
+def get_credentials():
+    """Recupera credenciais e realiza refresh se necessário."""
+    credentials_data = session.get("credentials")
+    if not credentials_data:
+        return None
+    credentials = Credentials(**credentials_data)
+    # Refresh automático se expirado e refresh_token disponível
+    if credentials.expired and credentials.refresh_token:
+        try:
+            from google.auth.transport.requests import Request
+            credentials.refresh(Request())
+            session["credentials"] = {
+                "token": credentials.token,
+                "refresh_token": credentials.refresh_token,
+                "token_uri": credentials.token_uri,
+                "client_id": credentials.client_id,
+                "client_secret": credentials.client_secret,
+                "scopes": credentials.scopes
+            }
+        except Exception:
+            session.pop("credentials", None)
+            return None
+    return credentials
+
+@calendar_bp.route("/authorize")
+def authorize():
+    """Iniciar processo de autorização OAuth 2.0"""
+    try:
+        # Verificar se arquivo de credenciais existe
+        if not os.path.exists(CLIENT_SECRETS_FILE):
+            return jsonify({
+                "error": "Credenciais do Google não configuradas. Entre em contato com o administrador.",
+                "admin_required": True
+            }), 503
+
+        flow = Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE,
+            scopes=SCOPES,
+            redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
+        )
+
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true'
+        )
+
+        session["oauth_state"] = state
+        return redirect(authorization_url)
+    except Exception as e:
+        return jsonify({"error": f"Erro na autorização: {str(e)}"}), 500
+
+@calendar_bp.route("/oauth2callback")
+def oauth2callback():
+    """Callback do OAuth 2.0"""
+    try:
+        state = session.get("oauth_state")
+        if not state:
+            return jsonify({"error": "Estado OAuth não encontrado"}), 400
+
+        flow = Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE,
+            scopes=SCOPES,
+            state=state,
+            redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
+        )
+
+        flow.fetch_token(authorization_response=request.url)
+
+        credentials = flow.credentials
+        session["credentials"] = {
+            "token": credentials.token,
+            "refresh_token": credentials.refresh_token,
+            "token_uri": credentials.token_uri,
+            "client_id": credentials.client_id,
+            "client_secret": credentials.client_secret,
+            "scopes": credentials.scopes
+        }
+
+        return jsonify({"message": "Autenticação bem-sucedida!"})
+    except Exception as e:
+        return jsonify({"error": f"Erro no callback OAuth: {str(e)}"}), 500
+
+@calendar_bp.route("/available_slots", methods=["POST"])
+def get_available_slots():
+    """Obter horários disponíveis dinamicamente de acordo com o tipo de serviço.
+        Regras:
+        - Duração: premium 80 min, individual/online 50 min.
+        - Buffer padrão entre sessões: 10 min.
+        - Geração: avalia início em passos iguais a (duração + buffer),
+            por exemplo 50min + 10min = 60min (intervalo de 1 hora) entre 09:00 e 18:00.
+        - Filtra contra períodos ocupados da FreeBusy API.
+    """
+    if "credentials" not in session:
+        # Em ambiente de desenvolvimento (debug), permitir um fallback para testar UI
+        if current_app and current_app.debug:
+            print('[DEBUG] Sem credenciais - usando fallback de desenvolvimento para gerar slots')
+            # Simular freebusy vazio e continuar
+            busy_periods = []
+        else:
+            return jsonify({
+                "error": "Sistema de agendamento temporariamente indisponível. Entre em contato via WhatsApp.",
+                "fallback": "whatsapp"
+            }), 401
+    else:
+        busy_periods = None
+
+    try:
+        credentials = get_credentials()
+        if not credentials:
+            return jsonify({
+                "error": "Sessão expirada. Reconecte o Google Calendar.",
+                "fallback": "whatsapp"
+            }), 401
+        service = build("calendar", "v3", credentials=credentials)
+
+        data = request.json or {}
+        print('[DEBUG] /calendar/available_slots called with:', data)
+        date = data.get('date')  # Formato: YYYY-MM-DD
+        service_type = data.get('service_type')  # individual | online | premium
+
+        if not date:
+            return jsonify({"error": "Data é obrigatória"}), 400
+        if not service_type:
+            return jsonify({"error": "Tipo de serviço é obrigatório"}), 400
+
+        duration_map = {
+            'premium': 80,
+            'individual': 50,
+            'online': 50
+        }
+        minutes = duration_map.get(service_type, 50)
+        slot_duration = timedelta(minutes=minutes)
+        buffer_duration = timedelta(minutes=10)
+
+        # Janela de trabalho
+        start_time = datetime.fromisoformat(f"{date}T09:00:00").replace(tzinfo=BRAZIL_TZ)
+        end_time = datetime.fromisoformat(f"{date}T18:00:00").replace(tzinfo=BRAZIL_TZ)
+
+        # FreeBusy consulta
+        freebusy_request = {
+            "timeMin": start_time.isoformat(),
+            "timeMax": end_time.isoformat(),
+            "timeZone": "America/Sao_Paulo",
+            "items": [{"id": "primary"}]
+        }
+        # Se já temos busy_periods (fallback), pular chamada externa
+        if busy_periods is None:
+            freebusy_result = service.freebusy().query(body=freebusy_request).execute()
+            busy_periods = freebusy_result["calendars"]["primary"].get("busy", [])
+            print(f"[DEBUG] FreeBusy returned {len(busy_periods)} busy periods")
+            # print busy periods truncated
+            for bp in busy_periods[:10]:
+                print('[DEBUG] busy:', bp)
+
+        # Normalizar períodos ocupados para comparação
+        normalized_busy = []
+        for busy in busy_periods:
+            b_start = datetime.fromisoformat(busy['start'].replace('Z', '+00:00'))
+            b_end = datetime.fromisoformat(busy['end'].replace('Z', '+00:00'))
+            if b_start.tzinfo is None:
+                b_start = b_start.replace(tzinfo=BRAZIL_TZ)
+            if b_end.tzinfo is None:
+                b_end = b_end.replace(tzinfo=BRAZIL_TZ)
+            normalized_busy.append((b_start, b_end))
+
+        # Iterar em passos iguais a duração da sessão + buffer (ex.: 50 + 10 = 60min)
+        # isso garante intervalos horários adequados quando a sessão tem duração
+        # menor que a hora (por exemplo sessões de 50min => intervalos de 1h).
+        step = slot_duration + buffer_duration
+        available_slots = []
+        current = start_time
+        # Janela de almoço (bloqueada): 12:00 - 13:00
+        lunch_start = datetime.fromisoformat(f"{date}T12:00:00").replace(tzinfo=BRAZIL_TZ)
+        lunch_end = datetime.fromisoformat(f"{date}T13:00:00").replace(tzinfo=BRAZIL_TZ)
+        while current + slot_duration <= end_time:
+            proposed_end = current + slot_duration
+            # Verificar conflitos (incluindo buffer no final para próxima sessão)
+            has_conflict = False
+            for b_start, b_end in normalized_busy:
+                # conflito se intervalo cruza período ocupado
+                if current < b_end and proposed_end > b_start:
+                    has_conflict = True
+                    break
+            if not has_conflict:
+                # Verificar também se adicionar buffer não cola em período ocupado seguinte
+                buffer_end = proposed_end + buffer_duration
+                conflict_buffer = False
+                for b_start, b_end in normalized_busy:
+                    if proposed_end < b_end and buffer_end > b_start:
+                        conflict_buffer = True
+                        break
+                # Também bloquear período de almoço: se o slot proposto overlap com
+                # lunch_start..lunch_end, ignorar (início ou fim dentro do almoço).
+                overlaps_lunch = not (proposed_end <= lunch_start or current >= lunch_end)
+                if not conflict_buffer and not overlaps_lunch:
+                    available_slots.append({
+                        'start': current.strftime('%H:%M'),
+                        'end': proposed_end.strftime('%H:%M'),
+                        'datetime': current.isoformat(),
+                        'duration_minutes': minutes,
+                        'service_type': service_type
+                    })
+            current += step
+
+        print(f"[DEBUG] Generated {len(available_slots)} available slots for {service_type} ({minutes}min)")
+        return jsonify({
+            "date": date,
+            "service_type": service_type,
+            "duration_minutes": minutes,
+            "available_slots": available_slots,
+            "timezone": "America/Sao_Paulo"
+        })
+
+    except HttpError:
+        return jsonify({
+            "error": "Erro ao acessar calendário. Tente novamente ou entre em contato via WhatsApp.",
+            "fallback": "whatsapp"
+        }), 500
+    except Exception:
+        return jsonify({
+            "error": "Erro temporário no sistema. Entre em contato via WhatsApp.",
+            "fallback": "whatsapp"
+        }), 500
+
+@calendar_bp.route("/schedule_appointment", methods=["POST"])
+def schedule_appointment():
+    """Agendar consulta completa com transação idempotente"""
+    if "credentials" not in session:
+        return jsonify({
+            "error": "Sistema de agendamento temporariamente indisponível. Entre em contato via WhatsApp.",
+            "fallback": "whatsapp"
+        }), 401
+
+    try:
+        data = request.json
+        
+        # Validar dados
+        required_fields = ['name', 'email', 'phone', 'date', 'time', 'service_type']
+        if not all(field in data for field in required_fields):
+            return jsonify({"error": "Todos os campos são obrigatórios"}), 400
+
+        # Criar evento no Google Calendar
+        credentials = get_credentials()
+        if not credentials:
+            return jsonify({
+                "error": "Sessão expirada. Reconecte o Google Calendar.",
+                "fallback": "whatsapp"
+            }), 401
+        service = build("calendar", "v3", credentials=credentials)
+
+        # Preparar dados do evento com timezone correto
+        start_datetime = datetime.fromisoformat(f"{data['date']}T{data['time']}:00").replace(tzinfo=BRAZIL_TZ)
+        # Definir duração conforme tipo (premium 80 min, demais 50)
+        duration_map = {
+            'premium': 80,
+            'individual': 50,
+            'online': 50
+        }
+        minutes = duration_map.get(data['service_type'], 50)
+        end_datetime = start_datetime + timedelta(minutes=minutes)
+        
+        # Mapear tipos de serviço
+        service_types = {
+            'individual': 'Terapia Individual',
+            'online': 'Terapia Online',
+            'premium': 'Sessão Premium'
+        }
+        
+        service_name = service_types.get(data['service_type'], 'Consulta')
+        
+        event = {
+            "summary": f"{service_name} - {data['name']}",
+            "location": "Online" if data['service_type'] == 'online' else "Consultório - Rua Halfeld 414/1001, Centro, Juiz de Fora-MG",
+            "description": f"Sessão de Terapia Cognitivo-Comportamental\n\nPaciente: {data['name']}\nTelefone: {data['phone']}\nEmail: {data['email']}\nTipo: {service_name}\n\nObservações: {data.get('message', 'Nenhuma observação')}",
+            "start": {
+                "dateTime": start_datetime.isoformat(),
+                "timeZone": "America/Sao_Paulo",
+            },
+            "end": {
+                "dateTime": end_datetime.isoformat(),
+                "timeZone": "America/Sao_Paulo",
+            },
+            "attendees": [
+                {"email": data['email']},
+            ],
+            "reminders": {
+                "useDefault": False,
+                "overrides": [
+                    {"method": "email", "minutes": 24 * 60},  # 24h antes
+                    {"method": "email", "minutes": 2 * 60},   # 2h antes
+                    {"method": "popup", "minutes": 10},       # 10min antes
+                ],
+            },
+        }
+
+        # Criar evento (transação idempotente)
+        created_event = service.events().insert(calendarId='primary', body=event).execute()
+
+        # Persistir no banco: criar/obter usuário e salvar agendamento
+        user = User.query.filter_by(email=data['email']).first()
+        if not user:
+            user = User(name=data['name'], email=data['email'], phone=data['phone'])
+            db.session.add(user)
+            db.session.flush()
+
+        appointment = Appointment(
+            user_id=user.id,
+            appointment_date=start_datetime,
+            service_type=data['service_type'],
+            google_event_id=created_event['id']
+        )
+        db.session.add(appointment)
+        db.session.commit()
+        
+        # TODO: Integrar com ERP aqui
+        # try:
+        #     erp_response = requests.post(
+        #         f"{ERP_BASE_URL}/api/appointments/",
+        #         json={
+        #             "google_event_id": created_event["id"],
+        #             "patient_name": data['name'],
+        #             "patient_email": data['email'],
+        #             "patient_phone": data['phone'],
+        #             "start_datetime": start_datetime.isoformat(),
+        #             "end_datetime": end_datetime.isoformat(),
+        #             "service_type": data['service_type']
+        #         },
+        #         headers={"Authorization": f"Bearer {ERP_TOKEN}"},
+        #         timeout=5
+        #     )
+        #     erp_response.raise_for_status()
+        # except Exception as erp_error:
+        #     # Se falhar no ERP, apagar o evento do Google para evitar inconsistência
+        #     service.events().delete(calendarId='primary', eventId=created_event["id"]).execute()
+        #     raise Exception(f"Erro na integração com sistema interno: {erp_error}")
+        
+        return jsonify({
+            "message": "Agendamento realizado com sucesso! Você receberá um email de confirmação em breve.",
+            "appointment": {
+                "event_id": created_event["id"],
+                "html_link": created_event["htmlLink"],
+                "start": created_event["start"],
+                "end": created_event["end"],
+                "patient_name": user.name,
+                "patient_email": user.email,
+                "service_type": service_name,
+                "duration_minutes": minutes,
+                "location": event["location"],
+                "local_id": appointment.id
+            }
+        })
+        
+    except HttpError as e:
+        if "already exists" in str(e).lower():
+            return jsonify({"error": "Este horário já foi agendado. Por favor, escolha outro horário."}), 409
+        return jsonify({
+            "error": "Erro ao criar agendamento. Tente novamente ou entre em contato via WhatsApp.",
+            "fallback": "whatsapp"
+        }), 500
+    except Exception as e:
+        return jsonify({
+            "error": "Erro temporário no sistema. Entre em contato via WhatsApp.",
+            "fallback": "whatsapp"
+        }), 500
+
+@calendar_bp.route("/auth_status", methods=["GET"])
+def auth_status():
+    """Verificar status de autenticação"""
+    if "credentials" in session:
+        try:
+            credentials = get_credentials()
+            if not credentials:
+                return jsonify({
+                    "authenticated": False,
+                    "status": "expired",
+                    "message": "Credenciais expiradas"
+                })
+            service = build("calendar", "v3", credentials=credentials)
+            service.calendarList().list().execute()
+            
+            return jsonify({
+                "authenticated": True,
+                "status": "connected",
+                "message": "Google Calendar conectado"
+            })
+        except Exception:
+            # Credenciais inválidas, limpar sessão
+            session.clear()
+            return jsonify({
+                "authenticated": False,
+                "status": "expired",
+                "message": "Credenciais expiradas"
+            })
+    else:
+        return jsonify({
+            "authenticated": False,
+            "status": "not_connected",
+            "message": "Google Calendar não conectado"
+        })
+
+
+@calendar_bp.route('/debug/fallback_on', methods=['GET'])
+def debug_fallback_on():
+    """Ativa fallback de desenvolvimento que ignora credenciais e simula disponibilidade.
+    Disponível apenas com app.debug == True.
+    """
+    if not (current_app and current_app.debug):
+        return jsonify({"error": "Disponível somente em modo debug"}), 403
+    session['use_dev_fallback'] = True
+    return jsonify({"message": "Dev fallback ativado"})
+
+
+@calendar_bp.route('/debug/fallback_off', methods=['GET'])
+def debug_fallback_off():
+    if not (current_app and current_app.debug):
+        return jsonify({"error": "Disponível somente em modo debug"}), 403
+    session.pop('use_dev_fallback', None)
+    return jsonify({"message": "Dev fallback desativado"})
+
+@calendar_bp.route("/logout", methods=["POST"])
+def logout():
+    """Fazer logout (limpar sessão)"""
+    session.clear()
+    return jsonify({"message": "Logout realizado com sucesso"})
+
+@calendar_bp.route("/admin/connect", methods=["GET"])
+def admin_connect():
+    """Página administrativa para conectar Google Calendar"""
+    auth_status_response = auth_status()
+    status_data = auth_status_response.get_json()
+    
+    if status_data["authenticated"]:
+        return jsonify({
+            "status": "connected",
+            "message": "Google Calendar já está conectado",
+            "actions": {
+                "test": "/calendar/admin/test",
+                "disconnect": "/calendar/logout"
+            }
+        })
+    else:
+        return jsonify({
+            "status": "not_connected",
+            "message": "Google Calendar não está conectado",
+            "actions": {
+                "connect": "/calendar/authorize"
+            }
+        })
+
+@calendar_bp.route("/admin/test", methods=["GET"])
+def admin_test():
+    """Testar integração com Google Calendar"""
+    if "credentials" not in session:
+        return jsonify({"error": "Não autenticado"}), 401
+    
+    try:
+        credentials = get_credentials()
+        if not credentials:
+            return jsonify({"error": "Sessão expirada"}), 401
+        service = build("calendar", "v3", credentials=credentials)
+        
+        # Testar listagem de calendários
+        calendar_list = service.calendarList().list().execute()
+        
+        # Testar busca de eventos hoje
+        today = datetime.now(BRAZIL_TZ).date()
+        start_time = datetime.combine(today, datetime.min.time()).replace(tzinfo=BRAZIL_TZ)
+        end_time = start_time + timedelta(days=1)
+        
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=start_time.isoformat(),
+            timeMax=end_time.isoformat(),
+            maxResults=10,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        events = events_result.get('items', [])
+        
+        return jsonify({
+            "status": "success",
+            "message": "Integração funcionando corretamente",
+            "data": {
+                "calendars_count": len(calendar_list.get('items', [])),
+                "events_today": len(events),
+                "timezone": "America/Sao_Paulo"
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Erro na integração: {str(e)}"
+        }), 500
+
