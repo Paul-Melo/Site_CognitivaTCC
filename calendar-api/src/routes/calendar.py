@@ -14,6 +14,20 @@ calendar_bp = Blueprint("calendar_bp", __name__)
 CLIENT_SECRETS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "client_secret.json")
 SCOPES = ["https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar.readonly"]
 
+# Suporte a configuração via variáveis de ambiente (mais seguro para produção).
+# Se `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET` estiverem definidos, usaremos
+# um client config em memória. Caso contrário, tentamos carregar `client_secret.json`.
+CLIENT_CONFIG = None
+if os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"):
+    CLIENT_CONFIG = {
+        "web": {
+            "client_id": os.environ.get("GOOGLE_CLIENT_ID"),
+            "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    }
+
 # Timezone do Brasil
 BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -45,18 +59,26 @@ def get_credentials():
 def authorize():
     """Iniciar processo de autorização OAuth 2.0"""
     try:
-        # Verificar se arquivo de credenciais existe
-        if not os.path.exists(CLIENT_SECRETS_FILE):
-            return jsonify({
-                "error": "Credenciais do Google não configuradas. Entre em contato com o administrador.",
-                "admin_required": True
-            }), 503
+        # Preferir credenciais via variáveis de ambiente (segurança)
+        if CLIENT_CONFIG is not None:
+            flow = Flow.from_client_config(
+                CLIENT_CONFIG,
+                scopes=SCOPES,
+                redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
+            )
+        else:
+            # Verificar se arquivo de credenciais existe
+            if not os.path.exists(CLIENT_SECRETS_FILE):
+                return jsonify({
+                    "error": "Credenciais do Google não configuradas. Entre em contato com o administrador.",
+                    "admin_required": True
+                }), 503
 
-        flow = Flow.from_client_secrets_file(
-            CLIENT_SECRETS_FILE,
-            scopes=SCOPES,
-            redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
-        )
+            flow = Flow.from_client_secrets_file(
+                CLIENT_SECRETS_FILE,
+                scopes=SCOPES,
+                redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
+            )
 
         authorization_url, state = flow.authorization_url(
             access_type='offline',
@@ -76,12 +98,20 @@ def oauth2callback():
         if not state:
             return jsonify({"error": "Estado OAuth não encontrado"}), 400
 
-        flow = Flow.from_client_secrets_file(
-            CLIENT_SECRETS_FILE,
-            scopes=SCOPES,
-            state=state,
-            redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
-        )
+        if CLIENT_CONFIG is not None:
+            flow = Flow.from_client_config(
+                CLIENT_CONFIG,
+                scopes=SCOPES,
+                state=state,
+                redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
+            )
+        else:
+            flow = Flow.from_client_secrets_file(
+                CLIENT_SECRETS_FILE,
+                scopes=SCOPES,
+                state=state,
+                redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
+            )
 
         flow.fetch_token(authorization_response=request.url)
 
