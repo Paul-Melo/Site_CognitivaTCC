@@ -226,30 +226,71 @@ Este relatório documenta todas as melhorias e ajustes implementados no site Equ
 
 ---
 
-## 🎯 Próximos Passos (5% Restante)
+## 🎯 Próximos Passos (5% Restante) — Checklist Prioritário
 
-### **Para Produção**
-1. **Configurar credenciais reais do Google**
-   - Obter client_id e client_secret
-   - Configurar domínio autorizado
-   - Testar OAuth em produção
+A seguir um checklist priorizado, com itens críticos, responsáveis técnicos sugeridos, e locais de código onde atuar para deixar o projeto pronto para produção.
 
-2. **Deploy e Monitoramento**
-   - Deploy do backend Flask
-   - Deploy do frontend React
-   - Configurar SSL/HTTPS
-   - Monitoramento de erros
+**ALTA PRIORIDADE (implementar antes do deploy)**
+- **Remover segredos do repositório e rotacionar credenciais:**
+   - Por que: evita exposição de client_secret e outros segredos.
+   - Arquivos/locais: `calendar-api/client_secret.json`, qualquer `*.env` com valores reais.
+   - Comandos sugeridos (local): `git rm --cached calendar-api/client_secret.json` e criar commit; para remoção de histórico use `bfg` ou `git filter-repo` (requer coordenação com colaboradores).
+   - Próximo passo recomendado: rotacionar `client_secret`/`client_id` no Google Cloud Console imediatamente.
 
-3. **Testes Finais**
-   - Teste completo do fluxo de agendamento
-   - Validação de emails
-   - Teste de integração Google Calendar
+- **Armazenar credenciais em variáveis de ambiente / secrets manager:**
+   - Arquivos/locais: `calendar-api/main.py`, `calendar-api/src/routes/calendar.py` — substituir leitura direta por `os.environ`.
+   - Criar/usar `calendar-api/.env.example` (sem valores reais).
 
-### **Melhorias Futuras**
-- Sistema de notificações por email
-- Dashboard administrativo
-- Relatórios de agendamentos
-- Integração com sistemas de pagamento
+- **Remover endpoints e fallbacks de desenvolvimento:**
+   - Arquivos/locais: `calendar-api/src/routes/calendar.py` — revisar e remover rotas `debug`/`dev` e o fallback de disponibilidade.
+   - Garantir que `DEBUG` seja controlado por `ENV`.
+
+- **Proteger sessão e tokens OAuth:**
+   - Arquivos/locais: `calendar-api/src/routes/calendar.py`, `calendar-api/src/models/*` (onde tokens são persistidos).
+   - Implementar: cookies `HttpOnly`, `Secure`, `SameSite=Strict`; armazenar tokens apenas no servidor (DB/Redis) com referência curta no cookie.
+
+- **Impedir double-booking / idempotência:**
+   - Arquivos/locais: `calendar-api/src/routes/calendar.py` (função `schedule_appointment`), `calendar-api/src/models/appointment.py` (ou onde persistir agendamento).
+   - Implementar lock/transaction DB e checagem idempotente (unique constraint por timeslot + serviço) antes da criação.
+
+**MÉDIA PRIORIDADE (antes dos primeiros usuários reais)**
+- **Configurar HTTPS e domínio/redirects OAuth:**
+   - Tarefas: TLS (Let's Encrypt), configurar `REDIRECT_URI` no Google Cloud Console.
+   - Locais: deployment infra (NGINX/Cloud Run/App Service) + `vite` build para frontend.
+
+- **Pipeline CI/CD e testes automatizados:**
+   - Arquivos/locais: criar `.github/workflows/ci.yml` e `.github/workflows/deploy.yml`.
+   - Testes sugeridos: unitários (backend), integração (calendar freebusy + schedule), e2e (fluxo de agendamento com Playwright/Cypress).
+
+- **Monitoramento e alertas:**
+   - Ferramentas: Sentry/LogRocket + métricas (Prometheus/Alertmanager ou serviço cloud).
+   - Locais: instrumentar `calendar-api/main.py` e front com hooks para erro.
+
+**BAIXA PRIORIDADE (após deploy estável)**
+- **Dashboard administrativo e cancelamento/reagendamento:**
+   - Arquivos/locais: `calendar-api/src/routes/admin.py` (nova rota), frontend admin em `cognitiva_tcc/src/components/admin/`.
+
+- **Notificações por email / SMS:**
+   - Integração: SMTP/SendGrid e Twilio; endpoints para enviar lembretes.
+
+- **Auditoria e testes de carga:**
+   - Executar testes de carga em endpoints de agendamento e verificações FreeBusy.
+
+---
+
+**Ações imediatas que posso executar agora (peça confirmação):**
+- 1) `Remover do índice Git` arquivos sensíveis (`git rm --cached calendar-api/client_secret.json`), commitar e push (não reescreve histórico).
+- 2) `Remover do histórico Git` (BFG/git-filter-repo) para excluir permanentemente segredos — requer coordenação e force-push; eu posso preparar os comandos e executá-los se você confirmar.
+- 3) `Substituir leituras diretas de client_secret.json` por `os.environ.get(...)` em `calendar-api/src/routes/calendar.py` e criar `calendar-api/.env.example`.
+
+**Notas de segurança importantes:**
+- Se `client_secret.json` já foi enviado ao GitHub, rotacione as credenciais no Google Cloud Console antes de qualquer outra ação.
+- Nunca coloque `node_modules` em commits; use `.gitignore` e, se já estiver no histórico remoto, remova com `git filter-repo`/BFG.
+
+---
+
+Se você confirmar, eu posso executar os passos 1 e 3 agora (criar commit para remover do índice e trocar leitura por variáveis de ambiente). Para o passo 2 (remoção do histórico) preciso de confirmação explícita, pois envolve reescrita de histórico e force-push.
+
 
 ---
 
