@@ -1,5 +1,5 @@
 from flask import Blueprint, request, redirect, url_for, session, jsonify, current_app
-from src.models.user import db, User, Appointment
+from src.models.user import db, User, Appointment, OAuthCredential
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -7,6 +7,7 @@ from googleapiclient.errors import HttpError
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import os
+import json
 
 calendar_bp = Blueprint("calendar_bp", __name__)
 
@@ -32,25 +33,41 @@ if os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET")
 BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
 
 def get_credentials():
-    """Recupera credenciais e realiza refresh se necessário."""
-    credentials_data = session.get("credentials")
-    if not credentials_data:
+    """Recupera credenciais a partir do banco usando `oauth_credential_id` na sessão.
+
+    Se necessário, realiza refresh e persiste os tokens atualizados no DB.
+    """
+    cred_id = session.get('oauth_credential_id')
+    if not cred_id:
         return None
-    credentials = Credentials(**credentials_data)
+
+    cred_obj = OAuthCredential.query.get(cred_id)
+    if not cred_obj:
+        session.pop('oauth_credential_id', None)
+        return None
+
+    credentials = Credentials(**cred_obj.to_credentials_dict())
     # Refresh automático se expirado e refresh_token disponível
     if credentials.expired and credentials.refresh_token:
         try:
             from google.auth.transport.requests import Request
             credentials.refresh(Request())
-            session["credentials"] = {
-                "token": credentials.token,
-                "refresh_token": credentials.refresh_token,
-                "token_uri": credentials.token_uri,
-                "client_id": credentials.client_id,
-                "scopes": credentials.scopes
-            }
+            # Persistir tokens atualizados no DB
+            cred_obj.token = credentials.token
+            cred_obj.refresh_token = credentials.refresh_token
+            cred_obj.token_uri = credentials.token_uri
+            cred_obj.scopes = json.dumps(list(credentials.scopes)) if credentials.scopes else None
+            if getattr(credentials, 'expiry', None):
+                cred_obj.expires_at = credentials.expiry
+            db.session.commit()
         except Exception:
-            session.pop("credentials", None)
+            # Remover credencial inválida
+            try:
+                db.session.delete(cred_obj)
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            session.pop('oauth_credential_id', None)
             return None
     return credentials
 
@@ -115,14 +132,23 @@ def oauth2callback():
         flow.fetch_token(authorization_response=request.url)
 
         credentials = flow.credentials
-        # Não armazenar client_secret na sessão por segurança.
-        session["credentials"] = {
-            "token": credentials.token,
-            "refresh_token": credentials.refresh_token,
-            "token_uri": credentials.token_uri,
-            "client_id": credentials.client_id,
-            "scopes": credentials.scopes
-        }
+        # Persistir credenciais no banco em vez de na sessão
+        try:
+            cred = OAuthCredential(
+                client_id=credentials.client_id,
+                token=credentials.token,
+                refresh_token=credentials.refresh_token,
+                token_uri=credentials.token_uri,
+                scopes=json.dumps(list(credentials.scopes)) if credentials.scopes else None,
+                expires_at=getattr(credentials, 'expiry', None)
+            )
+            db.session.add(cred)
+            db.session.commit()
+            # Armazenar apenas o identificador curto na sessão
+            session['oauth_credential_id'] = cred.id
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"error": f"Falha ao persistir credenciais: {e}"}), 500
 
         return jsonify({"message": "Autenticação bem-sucedida!"})
     except Exception as e:
@@ -139,7 +165,7 @@ def get_available_slots():
         - Filtra contra períodos ocupados da FreeBusy API.
     """
     # Requer usuário autenticado com credenciais na sessão em produção.
-    if "credentials" not in session:
+    if "oauth_credential_id" not in session:
         return jsonify({
             "error": "Sistema de agendamento indisponível. Conecte o Google Calendar.",
             "admin_required": True
@@ -267,7 +293,7 @@ def get_available_slots():
 @calendar_bp.route("/schedule_appointment", methods=["POST"])
 def schedule_appointment():
     """Agendar consulta completa com transação idempotente"""
-    if "credentials" not in session:
+    if "oauth_credential_id" not in session:
         return jsonify({
             "error": "Sistema de agendamento temporariamente indisponível. Entre em contato via WhatsApp.",
             "fallback": "whatsapp"
@@ -408,7 +434,7 @@ def schedule_appointment():
 @calendar_bp.route("/auth_status", methods=["GET"])
 def auth_status():
     """Verificar status de autenticação"""
-    if "credentials" in session:
+    if "oauth_credential_id" in session:
         try:
             credentials = get_credentials()
             if not credentials:
@@ -492,7 +518,7 @@ def admin_connect():
 @calendar_bp.route("/admin/test", methods=["GET"])
 def admin_test():
     """Testar integração com Google Calendar"""
-    if "credentials" not in session:
+    if "oauth_credential_id" not in session:
         return jsonify({"error": "Não autenticado"}), 401
     
     try:
