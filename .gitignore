@@ -31,3 +31,5 @@ build/
 .env
 .env.local
 .env.*.local
+
+calendar-api/client_secret.json
