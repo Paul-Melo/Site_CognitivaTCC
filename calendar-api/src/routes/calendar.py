@@ -47,7 +47,6 @@ def get_credentials():
                 "refresh_token": credentials.refresh_token,
                 "token_uri": credentials.token_uri,
                 "client_id": credentials.client_id,
-                "client_secret": credentials.client_secret,
                 "scopes": credentials.scopes
             }
         except Exception:
@@ -116,12 +115,12 @@ def oauth2callback():
         flow.fetch_token(authorization_response=request.url)
 
         credentials = flow.credentials
+        # Não armazenar client_secret na sessão por segurança.
         session["credentials"] = {
             "token": credentials.token,
             "refresh_token": credentials.refresh_token,
             "token_uri": credentials.token_uri,
             "client_id": credentials.client_id,
-            "client_secret": credentials.client_secret,
             "scopes": credentials.scopes
         }
 
@@ -139,19 +138,13 @@ def get_available_slots():
             por exemplo 50min + 10min = 60min (intervalo de 1 hora) entre 09:00 e 18:00.
         - Filtra contra períodos ocupados da FreeBusy API.
     """
+    # Requer usuário autenticado com credenciais na sessão em produção.
     if "credentials" not in session:
-        # Em ambiente de desenvolvimento (debug), permitir um fallback para testar UI
-        if current_app and current_app.debug:
-            print('[DEBUG] Sem credenciais - usando fallback de desenvolvimento para gerar slots')
-            # Simular freebusy vazio e continuar
-            busy_periods = []
-        else:
-            return jsonify({
-                "error": "Sistema de agendamento temporariamente indisponível. Entre em contato via WhatsApp.",
-                "fallback": "whatsapp"
-            }), 401
-    else:
-        busy_periods = None
+        return jsonify({
+            "error": "Sistema de agendamento indisponível. Conecte o Google Calendar.",
+            "admin_required": True
+        }), 401
+    busy_periods = None
 
     try:
         credentials = get_credentials()
