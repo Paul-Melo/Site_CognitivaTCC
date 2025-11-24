@@ -19,10 +19,36 @@ MIGRATIONS_DIR = os.path.dirname(__file__)
 
 def get_database_url():
     url = os.environ.get('DATABASE_URL')
-    if not url:
-        print('ERRO: variável de ambiente DATABASE_URL não encontrada. Defina-a antes de executar.')
+    if url:
+        return url
+
+    # Fallback: montar a URL a partir das variáveis PG* (útil quando a variável DATABASE_URL
+    # causa problemas de parsing em alguns ambientes Windows/PowerShell).
+    pg_host = os.environ.get('PGHOST', 'localhost')
+    pg_port = os.environ.get('PGPORT', '5432')
+    pg_user = os.environ.get('PGUSER', 'postgres')
+    pg_password = os.environ.get('PGPASSWORD')
+    pg_db = os.environ.get('PGDATABASE', 'cognitiva_tcc')
+
+    if not pg_password:
+        print('ERRO: nem DATABASE_URL nem PGPASSWORD definidos. Defina DATABASE_URL ou exporte PGPASSWORD/PGHOST/PGUSER/PGDATABASE/PGPORT.')
         sys.exit(1)
-    return url
+
+    # Construir URL de forma segura
+    try:
+        from sqlalchemy.engine import URL
+        url_obj = URL.create(
+            drivername='postgresql+psycopg2',
+            username=pg_user,
+            password=pg_password,
+            host=pg_host,
+            port=int(pg_port),
+            database=pg_db
+        )
+        return str(url_obj)
+    except Exception as e:
+        print(f'ERRO ao montar DATABASE_URL a partir de variáveis PG*: {e}')
+        sys.exit(1)
 
 
 def ensure_migrations_table(engine):
