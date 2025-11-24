@@ -4,6 +4,10 @@
 **Versão:** 2.0  
 **Responsável:** Desenvolvimento Manus AI
 
+**Atualização (23/11/2025):** Implementadas as ações pedidas pelo solicitante:
+- Adicionado `UniqueConstraint` em `Appointment` para prevenir double-booking (migration SQL adicionada em `calendar-api/migrations/0001_add_unique_constraint_appointment.sql`).
+- Adicionado modelo `OAuthCredential` e alteradas rotas para persistir tokens OAuth no banco e usar `session['oauth_credential_id']` (migration SQL exemplo em `calendar-api/migrations/0002_create_oauthcredential.sql`).
+
 ---
 
 ## 📋 Resumo Executivo
