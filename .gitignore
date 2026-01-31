@@ -26,6 +26,14 @@ env.bak/
 dist/
 build/
 /.parcel-cache
+dist.zip
+
+## Repo artifacts
+repo-backup.bundle
+
+## Misc large files
+*.bundle
+*.zip
 
 ## Secrets
 .env
