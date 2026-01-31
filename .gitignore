@@ -33,3 +33,9 @@ build/
 .env.*.local
 
 calendar-api/client_secret.json
+# SSH keys and private keys
+ssh-key-*.key
+*.pem
+*.key
+id_*
+*.ppk

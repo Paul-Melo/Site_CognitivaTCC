@@ -3,6 +3,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, session, send_from_directory
 from flask_cors import CORS
+from flask_session import Session as FlaskSession
+import redis as redis_lib
 from src.models.user import db
 from src.routes.user import user_bp
 from src.routes.calendar import calendar_bp
@@ -18,6 +20,27 @@ app = Flask(__name__, static_folder=os.path.join(os.path.dirname(__file__), 'sta
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', f"sqlite:///{os.path.join(os.path.dirname(__file__), 'database', 'app.db')}")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Session / Cookie security defaults for production
+# Use Redis-backed server-side sessions when REDIS_URL is provided
+redis_url = os.environ.get('REDIS_URL')
+if redis_url:
+    try:
+        redis_client = redis_lib.from_url(redis_url)
+        app.config['SESSION_TYPE'] = 'redis'
+        app.config['SESSION_REDIS'] = redis_client
+        app.config['SESSION_PERMANENT'] = False
+        # Ensure cookies are secure in production; can be overridden via env vars
+        app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SESSION_COOKIE_SECURE', '1') == '1'
+        app.config['SESSION_COOKIE_HTTPONLY'] = os.environ.get('SESSION_COOKIE_HTTPONLY', '1') == '1'
+        app.config['SESSION_COOKIE_SAMESITE'] = os.environ.get('SESSION_COOKIE_SAMESITE', 'Lax')
+        FlaskSession(app)
+    except Exception as e:
+        print(f"Aviso: falha ao conectar no Redis para sessão: {e}")
+else:
+    # If no Redis provided, ensure cookie flags are still secure by default
+    app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SESSION_COOKIE_SECURE', '0') == '1'
+    app.config['SESSION_COOKIE_HTTPONLY'] = os.environ.get('SESSION_COOKIE_HTTPONLY', '1') == '1'
+    app.config['SESSION_COOKIE_SAMESITE'] = os.environ.get('SESSION_COOKIE_SAMESITE', 'Lax')
 
 # Configuração de CORS restrita
 cors_origins = os.environ.get('CORS_ORIGINS', 'http://localhost:5173').split(',')

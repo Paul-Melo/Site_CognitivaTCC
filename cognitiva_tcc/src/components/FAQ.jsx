@@ -23,7 +23,7 @@ const FAQ = ({ onBack }) => {
     },
     {
       question: "Quanto tempo dura cada sessão?",
-      answer: "As sessões de Terapia Individual e Online têm duração de 50 minutos. A Sessão Especial tem duração de 80 minutos, oferecendo mais tempo para aprofundamento das questões trabalhadas."
+      answer: "As sessões possuem duração de 50 minutos cada."
     },
     {
       question: "Com que frequência devo fazer terapia?",
@@ -47,7 +47,7 @@ const FAQ = ({ onBack }) => {
     },
     {
       question: "Qual a diferença entre os tipos de atendimento?",
-      answer: "Terapia Individual (presencial): atendimento no consultório com duração de 50 minutos. Terapia Online: mesmo formato, mas por videochamada. Sessão Especial: atendimento diferenciado de 80 minutos com técnicas avançadas e maior aprofundamento."
+      answer: "Terapia Individual (presencial): atendimento no consultório com duração de 50 minutos. Terapia Online: mesmo formato, mas por videochamada. Avaliação Neuropsicológica: atendimento presencial de 50 minutos com técnicas avançadas e maior aprofundamento, com entrega de laudo ao final."
     },
     {
       question: "Como sei se a TCC é adequada para mim?",

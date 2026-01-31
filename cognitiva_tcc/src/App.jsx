@@ -290,7 +290,7 @@ function App() {
                       {[
                         { value: 'individual', name: 'Terapia Individual', desc: 'Atendimento presencial', price: '50 min' },
                         { value: 'online', name: 'Terapia Online', desc: 'Atendimento por videochamada', price: '50 min' },
-                        { value: 'premium', name: 'Sessão Especial', desc: 'Atendimento diferenciado', price: '80 min' }
+                        { value: 'premium', name: 'Avaliação Neuropsicológica', desc: 'Atendimento presencial', price: '50 min' }
                       ].map((service) => (
                         <label key={service.value} className={`block p-4 border rounded-lg cursor-pointer transition-colors ${
                           formData.service_type === service.value 
@@ -317,7 +317,7 @@ function App() {
                     </div>
                     <div className="bg-blue-50 p-4 rounded-lg">
                       <p className="text-sm text-blue-800">
-                        <strong>Duração:</strong> Sessões de 50 minutos (Especial: 80 min) com intervalo técnico entre atendimentos.
+                        <strong>Duração:</strong> Sessões de 50 minutos com intervalo técnico entre atendimentos.
                       </p>
                     </div>
                     <Button
@@ -510,7 +510,7 @@ function App() {
                       <div className="flex justify-between">
                         <span className="font-medium">Serviço:</span>
                         <span>{formData.service_type === 'individual' ? 'Terapia Individual' : 
-                               formData.service_type === 'online' ? 'Terapia Online' : 'Sessão Especial'}</span>
+                               formData.service_type === 'online' ? 'Terapia Online' : 'Avaliação Neuropsicológica'}</span>
                       </div>
                       <div className="flex justify-between">
                         <span className="font-medium">Data:</span>
@@ -838,7 +838,7 @@ function App() {
                 <div className="text-center mb-6">
                   <Users className="text-[var(--cognitiva-dourado)] mx-auto mb-4" size={48} />
                   <h3 className="text-2xl font-bold text-[var(--cognitiva-azul-petroleo)] mb-2">Terapia Individual</h3>
-                  <p className="text-gray-600">Atendimento presencial personalizado</p>
+                  <p className="text-gray-600">Atendimento presencial</p>
                 </div>
                 <ul className="space-y-3 mb-6">
                   <li className="flex items-center">
@@ -916,13 +916,13 @@ function App() {
               <CardContent className="p-8">
                 <div className="text-center mb-6">
                   <Award className="text-[var(--cognitiva-azul-petroleo)] mx-auto mb-4" size={48} />
-                  <h3 className="text-2xl font-bold text-[var(--cognitiva-azul-petroleo)] mb-2">Sessão Especial</h3>
-                  <p className="text-gray-600">Atendimento diferenciado</p>
+                  <h3 className="text-2xl font-bold text-[var(--cognitiva-azul-petroleo)] mb-2">Avaliação Neuropsicológica</h3>
+                  <p className="text-gray-600">Atendimento presencial personalizado</p>
                 </div>
                 <ul className="space-y-3 mb-6">
                   <li className="flex items-center">
                     <CheckCircle className="text-[var(--cognitiva-verde-salvia)] mr-2" size={16} />
-                    <span className="text-gray-700">Sessões de 80 minutos</span>
+                    <span className="text-gray-700">Sessões de 50 minutos</span>
                   </li>
                   <li className="flex items-center">
                     <CheckCircle className="text-[var(--cognitiva-verde-salvia)] mr-2" size={16} />

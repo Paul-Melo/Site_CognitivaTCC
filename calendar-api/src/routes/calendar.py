@@ -8,16 +8,16 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import os
 import json
+from sqlalchemy.exc import IntegrityError
 
 calendar_bp = Blueprint("calendar_bp", __name__)
 
 # Configurações do OAuth 2.0
-CLIENT_SECRETS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "client_secret.json")
 SCOPES = ["https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar.readonly"]
 
 # Suporte a configuração via variáveis de ambiente (mais seguro para produção).
-# Se `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET` estiverem definidos, usaremos
-# um client config em memória. Caso contrário, tentamos carregar `client_secret.json`.
+# Em produção, `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET` devem ser definidos.
+# Não existe fallback para `client_secret.json` para evitar vazamento de segredos.
 CLIENT_CONFIG = None
 if os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"):
     CLIENT_CONFIG = {
@@ -52,8 +52,11 @@ def get_credentials():
         try:
             from google.auth.transport.requests import Request
             credentials.refresh(Request())
-            # Persistir tokens atualizados no DB
-            cred_obj.token = credentials.token
+            # Persistir tokens atualizados no DB (usar encriptação quando disponível)
+            try:
+                cred_obj.set_encrypted_token(credentials.token)
+            except Exception:
+                cred_obj.token = credentials.token
             cred_obj.refresh_token = credentials.refresh_token
             cred_obj.token_uri = credentials.token_uri
             cred_obj.scopes = json.dumps(list(credentials.scopes)) if credentials.scopes else None
@@ -83,18 +86,12 @@ def authorize():
                 redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
             )
         else:
-            # Verificar se arquivo de credenciais existe
-            if not os.path.exists(CLIENT_SECRETS_FILE):
-                return jsonify({
-                    "error": "Credenciais do Google não configuradas. Entre em contato com o administrador.",
-                    "admin_required": True
-                }), 503
-
-            flow = Flow.from_client_secrets_file(
-                CLIENT_SECRETS_FILE,
-                scopes=SCOPES,
-                redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
-            )
+            # Em produção não existe fallback para arquivo local. Solicitar
+            # configuração via variáveis de ambiente.
+            return jsonify({
+                "error": "Credenciais do Google não configuradas. Defina GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET.",
+                "admin_required": True
+            }), 503
 
         authorization_url, state = flow.authorization_url(
             access_type='offline',
@@ -122,12 +119,10 @@ def oauth2callback():
                 redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
             )
         else:
-            flow = Flow.from_client_secrets_file(
-                CLIENT_SECRETS_FILE,
-                scopes=SCOPES,
-                state=state,
-                redirect_uri=url_for("calendar_bp.oauth2callback", _external=True)
-            )
+            return jsonify({
+                "error": "Credenciais do Google não configuradas. Defina GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET.",
+                "admin_required": True
+            }), 503
 
         flow.fetch_token(authorization_response=request.url)
 
@@ -136,12 +131,17 @@ def oauth2callback():
         try:
             cred = OAuthCredential(
                 client_id=credentials.client_id,
-                token=credentials.token,
                 refresh_token=credentials.refresh_token,
                 token_uri=credentials.token_uri,
                 scopes=json.dumps(list(credentials.scopes)) if credentials.scopes else None,
                 expires_at=getattr(credentials, 'expiry', None)
             )
+            # tentar encriptar token ao salvar
+            try:
+                cred.set_encrypted_token(credentials.token)
+            except Exception:
+                cred.token = credentials.token
+
             db.session.add(cred)
             db.session.commit()
             # Armazenar apenas o identificador curto na sessão
@@ -298,23 +298,13 @@ def schedule_appointment():
             "error": "Sistema de agendamento temporariamente indisponível. Entre em contato via WhatsApp.",
             "fallback": "whatsapp"
         }), 401
-
     try:
         data = request.json
-        
+
         # Validar dados
         required_fields = ['name', 'email', 'phone', 'date', 'time', 'service_type']
-        if not all(field in data for field in required_fields):
+        if not data or not all(field in data for field in required_fields):
             return jsonify({"error": "Todos os campos são obrigatórios"}), 400
-
-        # Criar evento no Google Calendar
-        credentials = get_credentials()
-        if not credentials:
-            return jsonify({
-                "error": "Sessão expirada. Reconecte o Google Calendar.",
-                "fallback": "whatsapp"
-            }), 401
-        service = build("calendar", "v3", credentials=credentials)
 
         # Preparar dados do evento com timezone correto
         start_datetime = datetime.fromisoformat(f"{data['date']}T{data['time']}:00").replace(tzinfo=BRAZIL_TZ)
@@ -326,16 +316,63 @@ def schedule_appointment():
         }
         minutes = duration_map.get(data['service_type'], 50)
         end_datetime = start_datetime + timedelta(minutes=minutes)
-        
+
         # Mapear tipos de serviço
         service_types = {
             'individual': 'Terapia Individual',
             'online': 'Terapia Online',
             'premium': 'Sessão Premium'
         }
-        
         service_name = service_types.get(data['service_type'], 'Consulta')
-        
+
+        # Primeiro, tentar reservar o horário no banco (transação)
+        try:
+            # Iniciar transação; commit será feito ao sair do bloco
+            with db.session.begin():
+                # Verificar se já existe agendamento para mesma data+serviço
+                existing = Appointment.query.filter_by(appointment_date=start_datetime, service_type=data['service_type']).first()
+                if existing:
+                    return jsonify({"error": "Este horário já foi agendado. Por favor, escolha outro horário."}), 409
+
+                # Criar ou obter usuário
+                user = User.query.filter_by(email=data['email']).first()
+                if not user:
+                    user = User(name=data['name'], email=data['email'], phone=data['phone'])
+                    db.session.add(user)
+                    db.session.flush()
+
+                # Inserir agendamento reservado (google_event_id será atualizado depois)
+                appointment = Appointment(
+                    user_id=user.id,
+                    appointment_date=start_datetime,
+                    service_type=data['service_type'],
+                    google_event_id=None
+                )
+                db.session.add(appointment)
+                db.session.flush()
+                reserved_id = appointment.id
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify({"error": "Conflito ao reservar horário. Por favor, escolha outro horário."}), 409
+
+        # A partir daqui o horário está reservado no DB; criar o evento no Google
+        credentials = get_credentials()
+        if not credentials:
+            # Limpar reserva local caso sessão inválida
+            try:
+                with db.session.begin():
+                    ap = Appointment.query.get(reserved_id)
+                    if ap:
+                        db.session.delete(ap)
+            except Exception:
+                db.session.rollback()
+            return jsonify({
+                "error": "Sessão expirada. Reconecte o Google Calendar.",
+                "fallback": "whatsapp"
+            }), 401
+
+        service = build("calendar", "v3", credentials=credentials)
+
         event = {
             "summary": f"{service_name} - {data['name']}",
             "location": "Online" if data['service_type'] == 'online' else "Consultório - Rua Halfeld 414/1001, Centro, Juiz de Fora-MG",
@@ -354,33 +391,53 @@ def schedule_appointment():
             "reminders": {
                 "useDefault": False,
                 "overrides": [
-                    {"method": "email", "minutes": 24 * 60},  # 24h antes
-                    {"method": "email", "minutes": 2 * 60},   # 2h antes
-                    {"method": "popup", "minutes": 10},       # 10min antes
+                    {"method": "email", "minutes": 24 * 60},
+                    {"method": "email", "minutes": 2 * 60},
+                    {"method": "popup", "minutes": 10},
                 ],
             },
         }
 
-        # Criar evento (transação idempotente)
-        created_event = service.events().insert(calendarId='primary', body=event).execute()
+        try:
+            created_event = service.events().insert(calendarId='primary', body=event).execute()
+        except HttpError as e:
+            # Remover reserva local se falhar na criação do evento
+            try:
+                with db.session.begin():
+                    ap = Appointment.query.get(reserved_id)
+                    if ap:
+                        db.session.delete(ap)
+            except Exception:
+                db.session.rollback()
+            if "already exists" in str(e).lower():
+                return jsonify({"error": "Este horário já foi agendado. Por favor, escolha outro horário."}), 409
+            return jsonify({
+                "error": "Erro ao criar evento no Google Calendar. Tente novamente.",
+                "fallback": "whatsapp"
+            }), 500
 
-        # Persistir no banco: criar/obter usuário e salvar agendamento
-        user = User.query.filter_by(email=data['email']).first()
-        if not user:
-            user = User(name=data['name'], email=data['email'], phone=data['phone'])
-            db.session.add(user)
-            db.session.flush()
-
-        appointment = Appointment(
-            user_id=user.id,
-            appointment_date=start_datetime,
-            service_type=data['service_type'],
-            google_event_id=created_event['id']
-        )
-        db.session.add(appointment)
-        db.session.commit()
-        
-        # TODO: Integrar com ERP aqui
+        # Atualizar o registro do agendamento com o ID do Google
+        try:
+            with db.session.begin():
+                ap = Appointment.query.get(reserved_id)
+                if not ap:
+                    # Situação inesperada: registro não encontrado
+                    # Tentar apagar o evento criado para não deixar órfão
+                    try:
+                        service.events().delete(calendarId='primary', eventId=created_event['id']).execute()
+                    except Exception:
+                        pass
+                    return jsonify({"error": "Erro interno ao confirmar agendamento."}), 500
+                ap.google_event_id = created_event['id']
+                db.session.add(ap)
+        except IntegrityError:
+            db.session.rollback()
+            # Em caso de falha ao atualizar DB, remover evento do Google
+            try:
+                service.events().delete(calendarId='primary', eventId=created_event['id']).execute()
+            except Exception:
+                pass
+            return jsonify({"error": "Erro ao salvar agendamento no sistema. Tente novamente."}), 500
         # try:
         #     erp_response = requests.post(
         #         f"{ERP_BASE_URL}/api/appointments/",
@@ -402,29 +459,24 @@ def schedule_appointment():
         #     service.events().delete(calendarId='primary', eventId=created_event["id"]).execute()
         #     raise Exception(f"Erro na integração com sistema interno: {erp_error}")
         
+        # Responder com dados finais do agendamento
+        user = User.query.get(user.id)
+        ap = Appointment.query.get(reserved_id)
         return jsonify({
             "message": "Agendamento realizado com sucesso! Você receberá um email de confirmação em breve.",
             "appointment": {
                 "event_id": created_event["id"],
-                "html_link": created_event["htmlLink"],
-                "start": created_event["start"],
-                "end": created_event["end"],
+                "html_link": created_event.get("htmlLink"),
+                "start": created_event.get("start"),
+                "end": created_event.get("end"),
                 "patient_name": user.name,
                 "patient_email": user.email,
                 "service_type": service_name,
                 "duration_minutes": minutes,
                 "location": event["location"],
-                "local_id": appointment.id
+                "local_id": ap.id
             }
         })
-        
-    except HttpError as e:
-        if "already exists" in str(e).lower():
-            return jsonify({"error": "Este horário já foi agendado. Por favor, escolha outro horário."}), 409
-        return jsonify({
-            "error": "Erro ao criar agendamento. Tente novamente ou entre em contato via WhatsApp.",
-            "fallback": "whatsapp"
-        }), 500
     except Exception as e:
         return jsonify({
             "error": "Erro temporário no sistema. Entre em contato via WhatsApp.",
